@@ -263,7 +263,7 @@ def eval_val(
             y = local[1:].unsqueeze(0)   # (1, seq_len)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = model(x, targets=None)  # (1, seq_len, vocab_size)
+                logits = model(x, target_ids=None)  # (1, seq_len, vocab_size)
 
             # Only score tokens in the last (seq_len - stride) positions for middle windows,
             # or all tokens for the first window
@@ -375,7 +375,7 @@ def eval_val_ttt(
         # Score this window (no gradients for scoring)
         with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = model(x, targets=None)
+                logits = model(x, target_ids=None)
 
         if start == 0:
             score_start = 0
