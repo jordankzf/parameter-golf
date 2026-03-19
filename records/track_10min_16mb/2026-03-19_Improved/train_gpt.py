@@ -542,6 +542,93 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
+
+# K-means codebook quantization: 4-bit (16 centroids) per row
+KMEANS_NUM_CENTROIDS = int(os.environ.get("KMEANS_CENTROIDS", "16"))
+KMEANS_ITERS = int(os.environ.get("KMEANS_ITERS", "20"))
+
+def _kmeans_1d(values: Tensor, k: int, n_iters: int) -> tuple[Tensor, Tensor]:
+    """Run 1-D k-means on a flat float tensor. Returns (centroids [k], assignments [N])."""
+    N = values.numel()
+    if N == 0:
+        return torch.zeros(k, dtype=values.dtype), torch.zeros(0, dtype=torch.int64)
+    # Init centroids via quantile spacing
+    q = torch.linspace(0, 1, k, device=values.device)
+    centroids = torch.quantile(values, q)
+    for _ in range(n_iters):
+        # Assign each value to nearest centroid
+        dists = (values.unsqueeze(1) - centroids.unsqueeze(0)).abs()  # [N, k]
+        assignments = dists.argmin(dim=1)
+        # Update centroids
+        for j in range(k):
+            mask = assignments == j
+            if mask.any():
+                centroids[j] = values[mask].mean()
+    return centroids, assignments
+
+def _pack_4bit(indices: Tensor) -> Tensor:
+    """Pack uint8 indices (0-15) into 4-bit pairs. Input length must be even."""
+    assert indices.dtype == torch.uint8
+    flat = indices.reshape(-1)
+    if flat.numel() % 2 != 0:
+        flat = torch.cat([flat, torch.zeros(1, dtype=torch.uint8)])
+    high = flat[0::2] << 4
+    low = flat[1::2] & 0x0F
+    return (high | low).contiguous()
+
+def _unpack_4bit(packed: Tensor, orig_numel: int) -> Tensor:
+    """Unpack 4-bit packed tensor back to uint8."""
+    high = (packed >> 4) & 0x0F
+    low = packed & 0x0F
+    interleaved = torch.stack([high, low], dim=-1).reshape(-1)
+    return interleaved[:orig_numel].contiguous()
+
+def quantize_tensor_kmeans(t: Tensor, k: int = KMEANS_NUM_CENTROIDS, n_iters: int = KMEANS_ITERS) -> tuple[Tensor, Tensor, Tensor]:
+    """Quantize a tensor using k-means codebook. Returns (packed_indices, codebook, orig_shape).
+    For 2D: per-row k-means with 4-bit packed indices (half the storage of int8).
+    For 1D: global k-means with 4-bit packing."""
+    assert k <= 16, f"4-bit packing supports at most 16 centroids, got {k}"
+    t32 = t.float()
+    orig_shape = torch.tensor(list(t.shape), dtype=torch.int32)
+    if t32.ndim == 2:
+        rows, cols = t32.shape
+        all_indices = torch.zeros(rows, cols, dtype=torch.uint8)
+        all_codebooks = torch.zeros(rows, k, dtype=torch.float16)
+        for r in range(rows):
+            centroids, assignments = _kmeans_1d(t32[r], k, n_iters)
+            all_indices[r] = assignments.to(torch.uint8)
+            all_codebooks[r] = centroids.to(torch.float16)
+        # Pack each row's indices into 4-bit
+        packed_rows = []
+        for r in range(rows):
+            packed_rows.append(_pack_4bit(all_indices[r]))
+        packed = torch.stack(packed_rows)
+        return packed.contiguous(), all_codebooks.contiguous(), orig_shape
+    else:
+        centroids, assignments = _kmeans_1d(t32.flatten(), k, n_iters)
+        packed = _pack_4bit(assignments.to(torch.uint8))
+        return packed.contiguous(), centroids.to(torch.float16).contiguous(), orig_shape
+
+def dequantize_tensor_kmeans(packed: Tensor, codebook: Tensor, orig_shape: Tensor) -> Tensor:
+    """Dequantize k-means quantized tensor from 4-bit packed format."""
+    shape = tuple(orig_shape.tolist())
+    if codebook.ndim == 2:
+        rows = codebook.shape[0]
+        cols = shape[1]
+        out = torch.zeros(rows, cols, dtype=torch.float32)
+        for r in range(rows):
+            indices = _unpack_4bit(packed[r], cols)
+            out[r] = codebook[r].float()[indices.long()]
+        return out
+    else:
+        numel = 1
+        for s in shape:
+            numel *= s
+        indices = _unpack_4bit(packed, numel)
+        return codebook.float()[indices.long()].reshape(shape)
+
+USE_KMEANS_QUANT = bool(int(os.environ.get("USE_KMEANS", "1")))
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], fp16_passthrough_names: set[str] | None = None):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
@@ -583,16 +670,27 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], fp16_passthrough_nam
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+        if USE_KMEANS_QUANT and t.ndim >= 1 and t.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+            # K-means 4-bit quantization: packed indices (half size) + codebook
+            packed, codebook, orig_shape = quantize_tensor_kmeans(t, k=KMEANS_NUM_CENTROIDS)
+            quantized[name] = packed
+            scales[name] = codebook
+            scheme = "kmeans_per_row" if t.ndim == 2 else "kmeans_global"
+            qmeta[name] = {"scheme": scheme, "k": KMEANS_NUM_CENTROIDS, "orig_shape": orig_shape.tolist()}
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(codebook)
+        else:
+            q, s = quantize_float_tensor(t)
+            if s.ndim > 0:
+                qmeta[name] = {"scheme": "per_row", "axis": 0}
+            quantized[name] = q
+            scales[name] = s
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "kmeans_int4_v1" if USE_KMEANS_QUANT else "int8_clean_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -611,7 +709,13 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        scheme = qmeta.get(name, {}).get("scheme", "")
+        if scheme.startswith("kmeans"):
+            # K-means dequantization: s is the codebook, q is packed 4-bit indices
+            orig_shape_list = qmeta[name]["orig_shape"]
+            orig_shape = torch.tensor(orig_shape_list, dtype=torch.int32)
+            out[name] = dequantize_tensor_kmeans(q, s, orig_shape).to(dtype=dtype).contiguous()
+        elif scheme == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
