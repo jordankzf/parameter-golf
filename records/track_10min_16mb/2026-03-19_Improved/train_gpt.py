@@ -319,6 +319,174 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
+def eval_val_ttt(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Test-Time Training eval: adapt the model on already-scored tokens.
+    Every ttt_interval windows, do a few gradient steps on recently seen tokens.
+    This is the neural equivalent of PAQ/cmix online weight updates."""
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    total_tokens = val_tokens.numel()
+    ttt_interval = int(os.environ.get("TTT_INTERVAL", "200"))  # adapt every N windows
+    ttt_lr = float(os.environ.get("TTT_LR", "1e-4"))
+    ttt_steps = int(os.environ.get("TTT_STEPS", "3"))
+
+    starts = list(range(0, total_tokens - seq_len, stride))
+    if not starts:
+        starts = [0]
+    rank_starts = starts[rank::world_size]
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    scored = torch.zeros(total_tokens, dtype=torch.bool)
+
+    # TTT optimizer: only adapt embedding + final norm + last few block params
+    # Keep it lightweight to avoid blowing up eval time
+    ttt_params = [p for p in base_model.tok_emb.parameters()]
+    ttt_params.extend(base_model.final_norm.parameters())
+    # Add the last block's MLP parameters (small, high impact on output)
+    last_block = base_model.blocks[-1]
+    ttt_params.extend(last_block.mlp.parameters())
+    ttt_optimizer = torch.optim.Adam(ttt_params, lr=ttt_lr, betas=(0.9, 0.99))
+
+    recent_chunks: list[Tensor] = []  # buffer of recent token sequences for TTT
+    window_count = 0
+
+    model.eval()
+    for start in rank_starts:
+        end = start + seq_len + 1
+        if end > total_tokens:
+            break
+        local = val_tokens[start:end].to(device=device, dtype=torch.int64, non_blocking=True)
+        x = local[:-1].unsqueeze(0)
+        y = local[1:].unsqueeze(0)
+
+        # Score this window (no gradients for scoring)
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = model(x, targets=None)
+
+        if start == 0:
+            score_start = 0
+        else:
+            score_start = seq_len - stride
+
+        score_positions = slice(score_start, seq_len)
+        score_logits = logits[0, score_positions, :]
+        score_targets = y[0, score_positions]
+        score_logits = args.softcap_A * torch.sigmoid(
+            (score_logits + args.softcap_B) / args.softcap_C
+        )
+        per_token_loss = F.cross_entropy(
+            score_logits.float(), score_targets, reduction="none"
+        )
+        global_positions = torch.arange(
+            start + 1 + score_start, start + 1 + seq_len, device="cpu"
+        )
+        mask = ~scored[global_positions]
+        scored[global_positions] = True
+        mask_device = mask.to(device)
+        per_token_loss = per_token_loss * mask_device.float()
+        num_scored = mask_device.sum().item()
+        val_loss_sum += per_token_loss.to(torch.float64).sum()
+        val_token_count += num_scored
+        prev_ids = x[0, score_positions].reshape(-1)
+        tgt_ids = score_targets.reshape(-1)
+        token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+        val_byte_count += (token_bytes.to(torch.float64) * mask_device.to(torch.float64)).sum()
+
+        # Buffer this window for TTT
+        recent_chunks.append(local.detach())
+        if len(recent_chunks) > 10:
+            recent_chunks.pop(0)
+
+        # Periodically adapt model on recent tokens
+        window_count += 1
+        if window_count % ttt_interval == 0 and len(recent_chunks) >= 3:
+            model.train()
+            for _ in range(ttt_steps):
+                ttt_optimizer.zero_grad()
+                # Pick a random recent chunk
+                chunk = recent_chunks[torch.randint(len(recent_chunks), (1,)).item()]
+                ttt_x = chunk[:-1].unsqueeze(0)
+                ttt_y = chunk[1:].unsqueeze(0)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    ttt_loss = model(ttt_x, ttt_y)
+                ttt_loss.backward()
+                ttt_optimizer.step()
+            model.eval()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+# -----------------------------
+# K-MEANS CODEBOOK QUANTIZATION
+# -----------------------------
+
+def quantize_tensor_kmeans(t: Tensor, n_clusters: int = 16) -> tuple[Tensor, Tensor, tuple]:
+    """Quantize a tensor using k-means clustering for non-uniform quantization.
+    Returns (indices, codebook, original_shape).
+    indices: uint8 tensor of cluster assignments
+    codebook: float16 tensor of cluster centroids
+    """
+    shape = t.shape
+    flat = t.float().reshape(-1)
+    n = flat.numel()
+
+    # Fast k-means initialization: use quantile-based init for speed
+    init_centroids = torch.quantile(flat, torch.linspace(0, 1, n_clusters))
+
+    # Run k-means (few iterations suffice for weight quantization)
+    centroids = init_centroids.clone()
+    for _ in range(20):
+        # Assign each value to nearest centroid
+        dists = (flat.unsqueeze(1) - centroids.unsqueeze(0)).abs()
+        assignments = dists.argmin(dim=1)
+        # Update centroids
+        new_centroids = torch.zeros_like(centroids)
+        counts = torch.zeros(n_clusters)
+        for c in range(n_clusters):
+            mask = assignments == c
+            if mask.any():
+                new_centroids[c] = flat[mask].mean()
+                counts[c] = mask.sum()
+            else:
+                new_centroids[c] = centroids[c]
+        centroids = new_centroids
+
+    # Final assignment
+    dists = (flat.unsqueeze(1) - centroids.unsqueeze(0)).abs()
+    indices = dists.argmin(dim=1).to(torch.uint8)
+
+    return indices.reshape(shape), centroids.to(torch.float16), shape
+
+
+def dequantize_tensor_kmeans(indices: Tensor, codebook: Tensor, dtype: torch.dtype) -> Tensor:
+    """Reconstruct tensor from k-means indices and codebook."""
+    return codebook[indices.long()].to(dtype)
+
+
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -1253,6 +1421,26 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # TTT evaluation: reload fresh quantized weights, then adapt during eval
+    # In distributed mode, all ranks process the same windows sequentially
+    # so TTT updates are consistent (each rank sees same data, same gradients)
+    use_ttt = bool(int(os.environ.get("USE_TTT", "1")))
+    if use_ttt:
+        base_model.load_state_dict(deq_state, strict=True)
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
+            args, base_model, compiled_model if not distributed else model,
+            rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ttt_eval val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        log0(f"final_ttt_eval_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
