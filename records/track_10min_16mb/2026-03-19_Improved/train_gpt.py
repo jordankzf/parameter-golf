@@ -1,15 +1,16 @@
 """
 Improved baseline for parameter-golf competition.
 Key changes from naive baseline:
-- SP-4096 tokenizer (better bytes/token ratio -> lower BPB)
 - Layer recurrence: 5 unique layers x 2 loops = 10 effective layers
 - Per-loop LoRA adapters on Q/K/V/O for loop specialization
 - SwiGLU MLP (replaces ReLU^2)
-- Wider model (dim=704) enabled by parameter savings from recurrence
 - Multi-token prediction with scheduled fadeout
 - Sliding window evaluation (stride-64)
 - Shifted softcap from modded-nanogpt
-- Cautious weight decay
+- seq_len=4096 (from PR#65)
+- Tuned Muon: momentum=0.99, lower LRs (from PR#65)
+- Smaller batch 393K for more steps/min (from PR#65)
+- fp16 tied embedding export (from PR#66)
 """
 
 from __future__ import annotations
@@ -40,10 +41,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 
 class Hyperparameters:
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp4096")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_4096_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -52,15 +53,15 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape - wider model with layer recurrence
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
+    # Model shape - layer recurrence with SwiGLU
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 5))
     num_recurrence_loops = int(os.environ.get("NUM_RECURRENCE_LOOPS", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -84,18 +85,21 @@ class Hyperparameters:
     # Sliding window eval
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
-    # Optimizer hyperparameters
+    # fp16 tied embedding export (keeps embedding in fp16 during quantization)
+    embed_fp16_export = bool(int(os.environ.get("EMBED_FP16_EXPORT", "1")))
+
+    # Optimizer hyperparameters (tuned from PR#65)
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    lora_lr = float(os.environ.get("LORA_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
+    lora_lr = float(os.environ.get("LORA_LR", 0.02))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -370,7 +374,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], fp16_passthrough_names: set[str] | None = None):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -381,6 +385,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
     )
+    if fp16_passthrough_names is None:
+        fp16_passthrough_names = set()
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -392,6 +398,14 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # Force fp16 passthrough for specified tensors (e.g. tied embedding)
+        if name in fp16_passthrough_names:
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
@@ -1177,6 +1191,7 @@ def main() -> None:
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # Remove MTP heads before saving (they're training-only)
+    # Keep tied embedding in fp16 (most quantization-sensitive tensor, per PR#66)
     save_state = {}
     for name, tensor in base_model.state_dict().items():
         if "mtp_heads" not in name:
@@ -1190,7 +1205,12 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(save_state)
+    # fp16 embedding export: keep embedding in fp16 (not int8) during quantization.
+    # The tied embedding is the most quantization-sensitive tensor (PR#66).
+    fp16_passthrough_names = set()
+    if args.embed_fp16_export and args.tie_embeddings:
+        fp16_passthrough_names.add("tok_emb.weight")
+    quant_obj, quant_stats = quantize_state_dict_int8(save_state, fp16_passthrough_names=fp16_passthrough_names)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
