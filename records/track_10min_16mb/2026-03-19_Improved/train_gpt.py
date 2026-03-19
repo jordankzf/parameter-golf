@@ -26,6 +26,11 @@ import sys
 import time
 import uuid
 import zlib
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    HAS_ZSTD = False
 from pathlib import Path
 
 import numpy as np
@@ -65,10 +70,10 @@ class Hyperparameters:
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 5))
     num_recurrence_loops = int(os.environ.get("NUM_RECURRENCE_LOOPS", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 544))
+    model_dim = int(os.environ.get("MODEL_DIM", 672))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     # SwiGLU uses 8/3 * dim for hidden, we round to multiple of 64
-    swiglu_mult = float(os.environ.get("SWIGLU_MULT", 2.667))
+    swiglu_mult = float(os.environ.get("SWIGLU_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     # Shifted softcap from modded-nanogpt: A * sigmoid((logits + B) / C)
@@ -1487,7 +1492,13 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    if HAS_ZSTD:
+        cctx = zstd.ZstdCompressor(level=22)
+        quant_blob = cctx.compress(quant_raw)
+        compress_label = "zstd-22"
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
+        compress_label = "zlib-9"
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1496,17 +1507,21 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model {compress_label}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size {compress_label}: {quant_file_bytes + code_bytes} bytes")
 
     # Roundtrip validation - reload quantized model
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    if HAS_ZSTD:
+        dctx = zstd.ZstdDecompressor()
+        quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk)), map_location="cpu")
+    else:
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     deq_state = dequantize_state_dict_int8(quant_state)
     # Re-add MTP heads as zeros for loading (they won't be used in eval)
     if base_model.mtp_heads is not None:
